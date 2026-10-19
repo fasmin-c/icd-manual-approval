@@ -1,0 +1,10 @@
+
+version: 0.2
+
+phases:
+  build:
+    commands:
+      - echo "Starting the CI/CD build"
+      - echo "Checking assignment files"
+      - test -f README.md
+      - echo "Build completed successfully"
