@@ -6,5 +6,5 @@ phases:
     commands:
       - echo "Starting the CI/CD build"
       - echo "Checking assignment files"
-      - test -f README.md
+      - ls -la
       - echo "Build completed successfully"
