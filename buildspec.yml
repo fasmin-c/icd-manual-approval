@@ -7,4 +7,4 @@ phases:
       - echo "Starting the CI/CD build"
       - echo "Checking assignment files"
       - ls -la
-      - echo "Build completed successfully"
+      - echo "Build completed successfully by fasmin"
