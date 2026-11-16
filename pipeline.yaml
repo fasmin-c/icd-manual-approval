@@ -1,0 +1,262 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  CI/CD pipeline using GitHub, CodeBuild, CodePipeline,
+  manual approval, and SNS notifications.
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Default: fasmin-c
+
+  GitHubRepository:
+    Type: String
+    Default: icd-manual-approval
+
+  GitHubBranch:
+    Type: String
+    Default: main
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for manual approval notifications
+
+Resources:
+
+  # GitHub connection
+  GitHubConnection:
+    Type: AWS::CodeConnections::Connection
+    Properties:
+      ConnectionName: icd-manual-approval-connection
+      ProviderType: GitHub
+
+  # S3 bucket for pipeline artifacts
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # SNS topic for approval notifications
+  ApprovalNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: ManualApprovalNotifications
+
+  # Email subscription
+  ApprovalEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+      TopicArn: !Ref ApprovalNotificationTopic
+
+  # CloudWatch log group for CodeBuild
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/codebuild/ManualApprovalBuild
+      RetentionInDays: 7
+
+  # CodeBuild IAM role
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${CodeBuildLogGroup.Arn}:*'
+
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource: !Sub '${ArtifactBucket.Arn}/*'
+
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource: !GetAtt ArtifactBucket.Arn
+
+  # CodeBuild project
+  ManualApprovalBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: ManualApprovalBuild
+      Description: Build project for manual approval pipeline
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        ImagePullCredentialsType: CODEBUILD
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec.yml
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref CodeBuildLogGroup
+      TimeoutInMinutes: 10
+
+  # CodePipeline IAM role
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelinePermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:AbortMultipartUpload
+                Resource: !Sub '${ArtifactBucket.Arn}/*'
+
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketVersioning
+                  - s3:ListBucket
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                Resource: !GetAtt ArtifactBucket.Arn
+
+              - Effect: Allow
+                Action:
+                  - codeconnections:UseConnection
+                Resource: !GetAtt GitHubConnection.ConnectionArn
+
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StopBuild
+                Resource: !GetAtt ManualApprovalBuild.Arn
+
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref ApprovalNotificationTopic
+
+  # Main CodePipeline
+  ManualApprovalPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: icd-manual-approval
+      PipelineType: V1
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+
+      Stages:
+
+        # Stage 1: GitHub source
+        - Name: Source
+          Actions:
+            - Name: GitHubSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              Configuration:
+                ConnectionArn: !GetAtt GitHubConnection.ConnectionArn
+                FullRepositoryId: !Sub '${GitHubOwner}/${GitHubRepository}'
+                BranchName: !Ref GitHubBranch
+                OutputArtifactFormat: CODE_ZIP
+                DetectChanges: 'true'
+              OutputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+
+        # Stage 2: Manual approval
+        - Name: ManualApproval
+          Actions:
+            - Name: ApprovalAction
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                NotificationArn: !Ref ApprovalNotificationTopic
+                CustomData: >
+                  Please review the GitHub changes and approve
+                  or reject this pipeline execution.
+              RunOrder: 1
+
+        # Stage 3: CodeBuild
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref ManualApprovalBuild
+              InputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+
+Outputs:
+
+  PipelineName:
+    Description: CodePipeline name
+    Value: !Ref ManualApprovalPipeline
+
+  BuildProjectName:
+    Description: CodeBuild project name
+    Value: !Ref ManualApprovalBuild
+
+  ApprovalTopicArn:
+    Description: SNS approval notification topic ARN
+    Value: !Ref ApprovalNotificationTopic
+
+  ArtifactBucketName:
+    Description: S3 artifact bucket name
+    Value: !Ref ArtifactBucket
+
+  GitHubConnectionArn:
+    Description: Automatically created GitHub connection ARN
+    Value: !GetAtt GitHubConnection.ConnectionArn
